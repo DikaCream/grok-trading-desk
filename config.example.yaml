@@ -1,1 +1,258 @@
-$file:/workspace/grok-trading-desk/config.example.yaml
+# grok-trading-desk — example configuration.
+# Copy to config.yaml and fill in secrets. config.yaml is gitignored.
+
+mode: "paper"            # "paper" | "live". "live" additionally requires --i-understand-the-risk
+
+grok:
+  api_key: "xai-REPLACE_ME"
+  base_url: "https://api.x.ai/v1/chat/completions"
+  models:
+    # grok-4-fast / grok-4 were retired 2026-05-15; both now redirect to
+    # grok-4.3, which quietly made the "checker runs a stronger model" premise
+    # false. See RESEARCH.md.
+    fast: "grok-4.3"    # the ten generator bots
+    deep: "grok-4.6"    # both adversarial checkers
+  reasoning_effort:
+    # Only grok-4.3 accepts this parameter: none | low | medium | high.
+    fast: "none"
+  structured_outputs: true    # response_format json_schema, strict
+  live_search: true           # without this the models answer from Feb 2026
+  max_search_results: 15
+  timeout_seconds: 30
+  max_retries: 3
+
+solana:
+  rpc_url: "https://api.mainnet-beta.solana.com"
+  wallet_key: "REPLACE_ME_BASE58_SECRET_KEY"
+  jito:
+    enabled: true
+    block_engine_url: "https://mainnet.block-engine.jito.wtf"
+    tip_lamports: 100000
+  priority_fee_microlamports: 200000
+  slippage_bps: 500
+  # Third live gate for crypto. Broadcasting needs mode: "live" AND
+  # --i-understand-the-risk AND this flag. Anything less runs paper fills.
+  live_broadcast: false
+
+# Paper fill simulation for crypto (used in paper mode and --dry-run).
+paper:
+  pump_fee_bps: 100           # protocol fee on the SOL leg (check current pump.fun fee)
+  default_slippage_bps: 150   # assumed impact when curve reserves are unknown
+  compute_unit_limit: 120000  # with priority_fee_microlamports -> network cost
+
+alpaca:
+  api_key: "REPLACE_ME"
+  api_secret: "REPLACE_ME"
+  paper: true
+
+pump_fun:
+  ws_url: "wss://pumpportal.fun/api/data"
+  api_key: ""              # optional; required for metered trade subscriptions
+  sol_price_usd: 210.0     # fallback only; the desk refreshes this at runtime
+  watch:
+    # A create event carries no holders, no trade counts and no age, so a token
+    # is watched before it is judged. See RESEARCH.md.
+    enabled: true
+    window_seconds: 300    # how long to accumulate trades before scoring
+    max_concurrent: 40     # trade subscriptions are metered; cap them
+    min_trades_to_score: 12
+
+risk:
+  total_budget_usd: 2000.0
+  daily_loss_limit_usd: 300.0
+  max_open_total: 12
+  max_open_crypto: 8
+  max_open_stocks: 6
+  max_per_sector: 2
+  crypto_max_pct: 0.85        # memecoin-first desk; allocator ceiling for crypto
+  stock_max_pct: 0.30         # keep equity book small unless you raise this
+  max_position_pct_of_market: 0.15   # <=15% of that market's budget per trade
+  max_position_pct_of_remaining_loss: 0.25  # <=25% of remaining daily loss room
+  # Crypto only: never size above this fraction of bonding-curve liquidity USD.
+  max_position_pct_of_liquidity: 0.03
+
+# Stage one: what a create event can actually be judged on.
+crypto_launch_filter:
+  min_curve_sol: 20.0        # vSolInBondingCurve at creation
+  max_curve_sol: 200.0
+  min_market_cap_sol: 25.0
+  max_market_cap_sol: 2000.0
+  max_dev_initial_buy_sol: 2.0   # a large self-buy is the classic bundle setup
+  require_metadata: true         # a uri that resolves to name/symbol/image
+  require_socials: false
+
+# Stage two: what the watch window measures.
+crypto_filter:
+  min_liquidity_usd: 5000.0
+  max_liquidity_usd: 400000.0
+  min_holders: 25
+  max_top10_holder_pct: 0.45
+  max_dev_holding_pct: 0.10
+  min_age_seconds: 60
+  max_age_seconds: 3600
+  min_buys: 15
+  min_buy_sell_ratio: 1.2
+  min_unique_traders: 12
+  require_mint_revoked: true   # unknown after enricher → mint_unknown (hard reject)
+  require_lp_burned: false     # leave false until LP status is reliably discoverable
+  # Anti-chase: reject tokens that already pumped/dumped hard during the watch window.
+  max_window_pump_pct: 0.80   # reject if +80% during watch window
+  min_window_pump_pct: -0.15  # reject if dumped hard already
+  # Adversarial checker must approve AND clear this confidence floor.
+  min_checker_confidence: 0.6
+
+stock_filter:
+  # market_cap and sector have no Alpaca source; when the datum is missing the
+  # filter is skipped rather than rejecting every candidate.
+  min_price: 3.0
+  max_price: 400.0
+  min_avg_volume: 750000
+  min_market_cap: 300000000
+  max_market_cap: 50000000000
+  min_rel_volume: 1.5
+  min_gap_pct: 0.02
+  max_gap_pct: 0.15
+  excluded_sectors: []
+
+scoring_weights:
+  crypto:
+    audit_safety: 0.35
+    narrative: 0.30
+    momentum: 0.20
+    pulse: 0.15
+    min_score_to_buy: 0.62
+  stocks:
+    fundamentals: 0.25
+    technicals: 0.25
+    news_sentiment: 0.20
+    insider: 0.15
+    pulse: 0.15
+    min_score_to_buy: 0.60
+
+# Entry quality scorecard (pure code). See STRATEGY.md for the thresholds' rationale.
+entry_scorecard:
+  enabled: true
+  min_entry_score: 0.55        # composite; regime gate adds to it in weak tapes
+  weights: {velocity: 0.25, holder_quality: 0.20, liquidity: 0.15, social_heat: 0.20, audit: 0.20}
+  kill_floors: {velocity: 0.20, holder_quality: 0.25, liquidity: 0.15, social_heat: 0.25, audit: 0.40}
+  velocity: {buys_per_min_lo: 1.0, buys_per_min_hi: 8.0, buy_share_lo: 0.50, buy_share_hi: 0.75}
+  holder_quality:
+    unique_ratio_lo: 0.15      # unique_traders / trades — low means wash / bot churn
+    unique_ratio_hi: 0.50
+    unique_traders_lo: 12
+    unique_traders_hi: 60
+    top10_good: 0.20
+    top10_bad: 0.45
+    dev_good: 0.02
+    dev_bad: 0.10
+    holders_lo: 25
+    holders_hi: 250
+  liquidity: {usd_lo: 5000, usd_hi: 60000, turnover_lo: 0.30, turnover_hi: 2.0}
+  grades: {A: 0.75, B: 0.65}   # size multiplier by grade below
+  grade_size_mult: {A: 1.0, B: 0.75, C: 0.5}
+
+# Regime gate on new crypto entries (exits are never gated).
+regime:
+  enabled: true
+  weak_go_signal: 0.50         # below → caution (min_go_signal still hard-pauses)
+  sol_dump_pct: -0.04          # measured SOL move over the lookback → defensive
+  sol_lookback_minutes: 60
+  pause_on_weak_and_dump: true # weak pulse AND SOL dumping → no new entries
+  caution: {min_score_add: 0.05, size_mult: 0.60}
+  defensive: {min_score_add: 0.10, size_mult: 0.40}
+
+# Scale-in: probe now, add only on confirmation.
+staged_entry:
+  enabled: true
+  initial_fraction: 0.40       # probe share of planned size
+  confirm_gain_pct: 0.08       # X: add needs >= +8% over the probe fill...
+  max_gain_for_add_pct: 0.30   # ...but not more than +30% (no chasing)
+  confirm_window_minutes: 10   # Y: otherwise the add expires
+  min_buys: 8                  # post-entry flow confirmation
+  min_buy_sell_ratio: 1.3
+  min_unique_buyers: 5
+  require_flow: true           # no tape data → no add
+
+# Toxic flow: deployer farms and metadata clones (scout stage one + desk blacklist).
+crypto_toxic:
+  enabled: true
+  deployer_window_minutes: 1440
+  max_launches_per_deployer: 2
+  clone_window_minutes: 180
+  max_clones: 3
+  reject_uri_reuse: true
+  reject_same_deployer_clone: true
+  blacklist_on: [emergency_dev_dump, emergency_dump, emergency_crash]
+
+# Hard vetoes for crypto audit signals (checked before weighted scoring).
+crypto_vetoes:
+  veto_bundled_launch: true
+  max_sniper_pct: 0.25
+  max_insider_pct: 0.15
+
+pulse:
+  crypto_cache_minutes: 15
+  market_cache_minutes: 30
+  min_go_signal: 0.30       # below this the whole market is paused
+
+exits:
+  interval_hours: 4              # stock / shared LLM exit cadence
+  crypto_interval_minutes: 20    # faster LLM exits for memecoins only
+  take_profit_pct: 0.20          # legacy single TP (only when ladder.enabled is false)
+  stop_loss_pct: 0.10            # hard stop below (average) entry
+  trim_fraction: 0.5
+  mechanical_poll_seconds: 30    # price poll + TP/SL/trailing/time-stop
+  # Optional HTTP template with {mint}; leave blank to rely on RPC / injected fetch.
+  price_url_template: ""
+  # Event-driven LLM exit when |pnl_pct| exceeds this (crypto stops loop).
+  crypto_move_trigger_pct: 0.15
+  # Trailing stop: arm after +N% from entry, then trail M% off peak.
+  trailing_stop_activate_pct: 0.25
+  trailing_stop_pct: 0.10
+  # Hard time-stop for memecoins (minutes) → CLOSE.
+  max_hold_minutes: 60
+  # Exit ladder: partial take-profits, breakeven stop, trailed runner.
+  ladder:
+    enabled: true
+    rungs:
+      - {gain_pct: 0.15, sell_fraction: 0.33}   # of base qty
+      - {gain_pct: 0.30, sell_fraction: 0.33}
+    breakeven_after_rung: 1       # stop → entry + buffer after this rung
+    breakeven_buffer_pct: 0.01
+    runner_trail_pct: 0.12        # trail the remaining ~34% off peak
+    runner_take_profit_pct: 1.50  # full close at +150% (runner cap)
+    stale_minutes: 20             # no +5% within 20 min and no rung → exit
+    stale_min_gain_pct: 0.05
+  # Dump detection → emergency CLOSE ahead of every other rule.
+  dump:
+    enabled: true
+    window_seconds: 90
+    flip_sell_buy_ratio: 2.0      # sells >= 2x buys (with >= min_sells)
+    flip_volume_ratio: 2.0        # or sell SOL >= 2x buy SOL
+    min_sells: 6
+    crash_pct: 0.15               # off the window high...
+    crash_from_peak_pct: 0.25     # ...or off the position peak
+    catastrophic_pct: 0.35        # price-only emergency
+    dev_sell_is_emergency: true
+
+market_hours:
+  timezone: "America/New_York"
+  open: "09:35"
+  close: "15:55"
+
+# Bull/bear debate before each checker (TradingAgents, arXiv 2412.20138).
+# Off by default: it doubles generator calls for a modest gain.
+debate:
+  enabled: false
+  rounds: 1
+
+# Past outcomes fed back into prompts (FinMem / TradingGPT / FinCon).
+memory:
+  enabled: true
+  max_examples: 5
+  lookback_days: 30
+
+logging:
+  path: "logs/desk.jsonl"
+  echo_stdout: true
+  cost_report_every: 25   # log a spend snapshot every N model calls
