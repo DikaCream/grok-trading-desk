@@ -152,7 +152,8 @@ def test_stage_one_boundaries_are_inclusive():
 def watched_token(**over) -> Token:
     base = dict(
         mint="MINT1", symbol="WIF2", liquidity_usd=20000.0, holders=100,
-        unique_traders=40, age_seconds=300, buys=60, sells=20,
+        holders_known=True, unique_traders=40, age_seconds=300, buys=60, sells=20,
+        mint_revoked=True,
     )
     base.update(over)
     return Token(**base)
@@ -181,11 +182,11 @@ def test_stage_two_rejection_reasons(over, reason):
     assert filter_reason(watched_token(**over), WATCH_FILTER) == reason
 
 
-def test_unverified_mint_authority_is_not_a_rejection():
-    # The feed never reports it, so None must mean "ask the auditor", not "no".
+def test_unknown_mint_authority_is_rejected_when_required():
+    # After the enricher path: None means unknown and must NOT silently pass.
     strict = {**WATCH_FILTER, "require_mint_revoked": True, "require_lp_burned": True}
-    assert watched_token().mint_revoked is None
-    assert filter_reason(watched_token(), strict) is None
+    assert filter_reason(watched_token(mint_revoked=None), strict) == "mint_unknown"
+    assert filter_reason(watched_token(mint_revoked=True, lp_burned=None), strict) == "lp_unknown"
 
 
 def test_a_confirmed_live_mint_authority_still_rejects():
@@ -289,37 +290,40 @@ def test_watchlist_capacity_is_enforced():
     assert s.handle_create({**CREATE_EVENT, "mint": "M99"}) is None
 
 
-def test_mature_returns_only_survivors_of_the_window():
+async def test_mature_returns_only_survivors_of_the_window():
     s = scout()
+    # Without enricher, require_mint_revoked would kill every token — leave it off
+    # here so this test stays about the watch window + trade filter.
+    s.filter = {k: v for k, v in s.filter.items() if k != "require_mint_revoked"}
     token = s.handle_create(CREATE_EVENT)
     watch = Watch(token, window_seconds=300, now=0.0)
     s.watching[token.mint] = watch
     for i in range(30):
         watch.record(trade(trader=f"T{i}"))
 
-    assert s.mature(now=100.0) == []            # window still open
-    ready = s.mature(now=400.0)
+    assert await s.mature(now=100.0) == []            # window still open
+    ready = await s.mature(now=400.0)
     assert [t.mint for t in ready] == ["MINT1"]
     assert ready[0].buys == 30
     assert s.watching == {}                      # evicted
 
 
-def test_mature_drops_a_token_with_too_little_trading():
+async def test_mature_drops_a_token_with_too_little_trading():
     s = scout()
     token = s.handle_create(CREATE_EVENT)
     watch = Watch(token, window_seconds=300, now=0.0)
     s.watching[token.mint] = watch
     watch.record(trade())                        # 1 trade, below min_trades_to_score
-    assert s.mature(now=400.0) == []
+    assert await s.mature(now=400.0) == []
 
 
-def test_mature_evicts_immediately_when_the_deployer_sells():
+async def test_mature_evicts_immediately_when_the_deployer_sells():
     s = scout()
     token = s.handle_create(CREATE_EVENT)
     watch = Watch(token, window_seconds=300, now=0.0)
     s.watching[token.mint] = watch
     watch.record(trade(side="sell", trader="DEV1"))
-    assert s.mature(now=1.0) == []               # before the window closes
+    assert await s.mature(now=1.0) == []               # before the window closes
     assert s.watching == {}
 
 
@@ -366,3 +370,43 @@ async def test_watch_disabled_yields_immediately():
     ready = await s._on_message(json.dumps(CREATE_EVENT))
     assert [t.mint for t in ready] == ["MINT1"]
     assert ready[0].liquidity_usd == pytest.approx(6400.0)
+
+
+# --- anti-chase via price_change_pct (improve-memecoin-exits) -----------------
+
+ANTI_CHASE_FILTER = {
+    **WATCH_FILTER,
+    "max_window_pump_pct": 0.80,
+    "min_window_pump_pct": -0.15,
+}
+
+
+def test_anti_chase_rejects_window_pump_above_threshold():
+    assert filter_reason(
+        watched_token(price_change_pct=0.81), ANTI_CHASE_FILTER
+    ) == "window_pump_too_high"
+    # exclusive above: exactly 0.80 still passes
+    assert filter_reason(
+        watched_token(price_change_pct=0.80), ANTI_CHASE_FILTER
+    ) is None
+
+
+def test_anti_chase_rejects_window_dump_below_threshold():
+    assert filter_reason(
+        watched_token(price_change_pct=-0.16), ANTI_CHASE_FILTER
+    ) == "window_dump_too_hard"
+    assert filter_reason(
+        watched_token(price_change_pct=-0.15), ANTI_CHASE_FILTER
+    ) is None
+
+
+def test_anti_chase_absent_keys_do_not_reject():
+    # Old configs without the keys keep working — no silent anti-chase.
+    assert filter_reason(watched_token(price_change_pct=5.0), WATCH_FILTER) is None
+    assert filter_reason(watched_token(price_change_pct=-0.99), WATCH_FILTER) is None
+
+
+def test_anti_chase_moderate_move_passes():
+    assert filter_reason(
+        watched_token(price_change_pct=0.40), ANTI_CHASE_FILTER
+    ) is None
