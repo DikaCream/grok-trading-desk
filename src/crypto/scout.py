@@ -30,6 +30,8 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from ..models import Token
+from .flow import FlowTracker
+from .toxic_flow import ToxicFlowFilter
 
 log = logging.getLogger(__name__)
 
@@ -129,8 +131,10 @@ def filter_reason(token: Token, filt: dict[str, Any]) -> str | None:
     if max_liq is not None and token.liquidity_usd > max_liq:
         return "liquidity_too_high"
 
+    # Holders come from the on-chain enricher; unique_traders from the watch
+    # window. Only enforce min_holders when a real count exists.
     min_holders = filt.get("min_holders")
-    if min_holders is not None and token.holders < min_holders:
+    if min_holders is not None and token.holders_known and token.holders < min_holders:
         return "too_few_holders"
 
     min_traders = filt.get("min_unique_traders")
@@ -164,13 +168,29 @@ def filter_reason(token: Token, filt: dict[str, Any]) -> str | None:
     if token.dev_sold:
         return "dev_sold"
 
-    # Only enforce what has actually been checked: None means unknown, and an
-    # unknown is the auditor's problem, not a silent rejection here.
-    if filt.get("require_mint_revoked") and token.mint_revoked is False:
-        return "mint_not_revoked"
+    # Hard requires: unknown must NOT silently pass. Enrich before filtering;
+    # if still None after enrichment, reject with mint_unknown / lp_unknown.
+    if filt.get("require_mint_revoked"):
+        if token.mint_revoked is None:
+            return "mint_unknown"
+        if token.mint_revoked is False:
+            return "mint_not_revoked"
 
-    if filt.get("require_lp_burned") and token.lp_burned is False:
-        return "lp_not_burned"
+    if filt.get("require_lp_burned"):
+        if token.lp_burned is None:
+            return "lp_unknown"
+        if token.lp_burned is False:
+            return "lp_not_burned"
+
+    # Anti-chase: reject tokens that already ran (or dumped) during the watch window.
+    # Missing keys mean "no opinion" so old configs keep working unchanged.
+    max_pump = filt.get("max_window_pump_pct")
+    if max_pump is not None and token.price_change_pct > float(max_pump):
+        return "window_pump_too_high"
+
+    min_pump = filt.get("min_window_pump_pct")
+    if min_pump is not None and token.price_change_pct < float(min_pump):
+        return "window_dump_too_hard"
 
     return None
 
@@ -255,7 +275,7 @@ class Watch:
                 "buys": self.buys,
                 "sells": self.sells,
                 "unique_traders": len(self.traders),
-                "holders": len(self.traders),  # best available proxy from the feed
+                # holders left for OnChainEnricher — do not proxy unique_traders
                 "observed_seconds": round(elapsed, 2),
                 "age_seconds": round(elapsed, 2),
                 "volume_sol": round(self.volume_sol, 6),
@@ -271,10 +291,26 @@ class Scout:
 
     name = "scout"
 
-    def __init__(self, config: dict[str, Any], connect=None):
+    def __init__(
+        self,
+        config: dict[str, Any],
+        connect=None,
+        enricher=None,
+        toxic: ToxicFlowFilter | None = None,
+        flow: FlowTracker | None = None,
+    ):
         self.config = config or {}
         self.launch_filter = self.config.get("crypto_launch_filter", {}) or {}
         self.filter = self.config.get("crypto_filter", {}) or {}
+        self.enricher = enricher
+        # Toxic-flow memory sees every create event (filtered or not). Only on
+        # when injected or explicitly enabled, so bare configs keep old behaviour.
+        if toxic is None and (self.config.get("crypto_toxic", {}) or {}).get("enabled"):
+            toxic = ToxicFlowFilter(self.config)
+        self.toxic = toxic
+        # Post-entry tape for open positions (staged adds + dump detection).
+        self.flow = flow or FlowTracker()
+        self.reject_counts: dict[str, int] = {}
 
         pump = self.config.get("pump_fun", {}) or {}
         self.ws_url = pump.get("ws_url", "wss://pumpportal.fun/api/data")
@@ -308,9 +344,17 @@ class Scout:
         if not token.mint or token.mint in self.seen:
             return None
         self.seen.add(token.mint)
+        if self.toxic is not None:
+            self.toxic.observe(token)
 
         if launch_reason(token, self.launch_filter) is not None:
             return None
+        if self.toxic is not None:
+            toxic = self.toxic.reason(token)
+            if toxic is not None:
+                self.reject_counts[toxic] = self.reject_counts.get(toxic, 0) + 1
+                log.info("toxic reject %s (%s): %s", token.mint, token.creator, toxic)
+                return None
         if len(self.watching) >= self.max_concurrent:
             # Metered subscription: better to miss one than to blow the budget.
             log.debug("watchlist full, skipping %s", token.mint)
@@ -323,9 +367,26 @@ class Scout:
         watch = self.watching.get(mint)
         if watch is not None:
             watch.record(payload)
+        self.flow.record(payload)
 
-    def mature(self, sol_usd: float | None = None, now: float | None = None) -> list[Token]:
-        """Pop every watch whose window has closed, filtered to the survivors."""
+    async def track_position(self, mint: str, creator: str = "") -> None:
+        """Keep (or start) the trade subscription for an open position."""
+        if not mint:
+            return
+        already = self.flow.is_tracked(mint) or mint in self.watching
+        self.flow.track(mint, creator)
+        if not already:
+            await self._subscribe_trades(mint)
+
+    async def untrack_position(self, mint: str) -> None:
+        if not mint or not self.flow.is_tracked(mint):
+            return
+        self.flow.untrack(mint)
+        if mint not in self.watching:
+            await self._unsubscribe_trades([mint])
+
+    async def mature(self, sol_usd: float | None = None, now: float | None = None) -> list[Token]:
+        """Pop every watch whose window has closed, enrich, then filter survivors."""
         sol_usd = self.sol_price_usd if sol_usd is None else sol_usd
         ready: list[Token] = []
         for mint, watch in list(self.watching.items()):
@@ -338,8 +399,16 @@ class Scout:
             token = watch.result(sol_usd, now)
             if token.trades < self.min_trades_to_score:
                 continue
-            if filter_reason(token, self.filter) is None:
+            if self.enricher is not None:
+                try:
+                    token = await self.enricher.enrich(token)
+                except Exception as exc:  # noqa: BLE001 - enricher must not kill the scout
+                    log.warning("enricher failed for %s: %s", mint, exc)
+            reason = filter_reason(token, self.filter)
+            if reason is None:
                 ready.append(token)
+            else:
+                log.info("stage-two reject %s: %s", mint, reason)
         return ready
 
     # -- socket -----------------------------------------------------------------------
@@ -375,6 +444,11 @@ class Scout:
                     attempt = 0
                     await ws.send(json.dumps({"method": "subscribeNewToken"}))
                     log.info("scout subscribed to new tokens")
+                    if self.flow.tracked:
+                        # Reconnect: open positions must not lose their tape.
+                        await ws.send(
+                            json.dumps({"method": "subscribeTokenTrade", "keys": self.flow.tracked})
+                        )
 
                     async for message in ws:
                         for token in await self._on_message(message):
@@ -408,8 +482,8 @@ class Scout:
             self.handle_trade(payload)
 
         before = set(self.watching)
-        ready = self.mature()
-        finished = list(before - set(self.watching))
+        ready = await self.mature()
+        finished = [m for m in before - set(self.watching) if not self.flow.is_tracked(m)]
         await self._unsubscribe_trades(finished)
         return ready
 
