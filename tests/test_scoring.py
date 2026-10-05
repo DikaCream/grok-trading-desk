@@ -181,3 +181,52 @@ def test_stock_custom_weights_change_the_verdict():
     result = ss.score_stock(STOCK, mediocre_fundamentals, CLEAN_RADAR, CLEAN_INSIDER,
                             OPEN_PULSE, weights=fundamentals_heavy)
     assert result["buy"] is False
+
+
+# --- hard vetoes: bundled / sniper / insider (improve-memecoin-exits) ----------
+
+def test_crypto_bundled_launch_is_hard_vetoed():
+    audit = {**CLEAN_AUDIT, "bundled_launch": True}
+    result = cs.score_token(TOKEN, audit, STRONG_NARRATIVE, OPEN_PULSE)
+    assert result["vetoed"] is True
+    assert result["reason"] == "veto_bundled_launch"
+    assert result["buy"] is False and result["score"] == 0.0
+
+
+def test_crypto_sniper_pct_above_threshold_is_vetoed():
+    audit = {**CLEAN_AUDIT, "sniper_pct": 0.26}
+    result = cs.score_token(TOKEN, audit, STRONG_NARRATIVE, OPEN_PULSE)
+    assert result["reason"] == "veto_sniper_pct"
+
+    edge = cs.score_token(
+        TOKEN, {**CLEAN_AUDIT, "sniper_pct": 0.25}, STRONG_NARRATIVE, OPEN_PULSE
+    )
+    assert edge["vetoed"] is False  # exclusive above threshold
+
+
+def test_crypto_insider_pct_above_threshold_is_vetoed():
+    audit = {**CLEAN_AUDIT, "insider_pct": 0.16}
+    result = cs.score_token(TOKEN, audit, STRONG_NARRATIVE, OPEN_PULSE)
+    assert result["reason"] == "veto_insider_pct"
+
+    edge = cs.score_token(
+        TOKEN, {**CLEAN_AUDIT, "insider_pct": 0.15}, STRONG_NARRATIVE, OPEN_PULSE
+    )
+    assert edge["vetoed"] is False
+
+
+def test_crypto_veto_thresholds_are_configurable():
+    loose = {"veto_bundled_launch": False, "max_sniper_pct": 0.90, "max_insider_pct": 0.90}
+    audit = {**CLEAN_AUDIT, "bundled_launch": True, "sniper_pct": 0.5, "insider_pct": 0.4}
+    result = cs.score_token(
+        TOKEN, audit, STRONG_NARRATIVE, OPEN_PULSE, vetoes=loose
+    )
+    assert result["vetoed"] is False
+    assert result["buy"] is True
+
+
+def test_crypto_veto_defaults_apply_when_config_omitted():
+    # hard_veto with no vetoes arg still enforces bundled/sniper/insider defaults
+    assert cs.hard_veto({**CLEAN_AUDIT, "bundled_launch": True}, OPEN_PULSE) == "veto_bundled_launch"
+    assert cs.hard_veto({**CLEAN_AUDIT, "sniper_pct": 0.30}, OPEN_PULSE) == "veto_sniper_pct"
+    assert cs.hard_veto({**CLEAN_AUDIT, "insider_pct": 0.20}, OPEN_PULSE) == "veto_insider_pct"
