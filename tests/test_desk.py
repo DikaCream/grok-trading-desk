@@ -32,8 +32,11 @@ GOOD = {
     "exit_manager": {"action": "HOLD", "reason": "intact", "confidence": 0.6},
 }
 
+# Curve reserves are part of every real token: without a quote price the paper
+# book refuses to open (no_quote_price), exactly as a live venue would.
 TOKEN = Token(mint="M1", symbol="WIF2", holders=200, buys=90, sells=25, unique_traders=60,
-              liquidity_usd=40000, mint_revoked=True, age_seconds=300)
+              liquidity_usd=40000, mint_revoked=True, age_seconds=300,
+              curve_sol=32.0, curve_tokens=800_000_000.0)
 STOCK = Stock(symbol="ACME", sector="technology", price=50, prev_close=46,
               avg_volume=2e6, volume=6e6, market_cap=5e9)
 
@@ -233,3 +236,111 @@ def test_market_hours_window(tmp_path):
     assert desk.market_is_open(weekday.replace(hour=8, minute=0)) is False
     saturday = datetime(2026, 8, 29, 10, 0, tzinfo=timezone.utc)
     assert desk.market_is_open(saturday) is False
+
+
+# --- mechanical TP/SL for crypto (improve-memecoin-exits) ----------------------
+
+from src.desk import check_crypto_stops, crypto_stop_tp_prices, curve_price
+
+
+def test_crypto_stop_tp_prices_from_entry():
+    stop, tp = crypto_stop_tp_prices(1.0, take_profit_pct=0.20, stop_loss_pct=0.08)
+    assert stop == pytest.approx(0.92)
+    assert tp == pytest.approx(1.20)
+    assert crypto_stop_tp_prices(0.0) == (None, None)
+
+
+def test_check_crypto_stops_triggers_close_on_stop_and_tp():
+    pos = Position(
+        market=Market.CRYPTO, symbol="WIF2", quantity=1000,
+        entry_price=1.0, current_price=1.0,
+        stop_price=0.92, take_profit_price=1.20,
+    )
+    assert check_crypto_stops(pos, 0.92) == "stop_loss"
+    assert check_crypto_stops(pos, 0.91) == "stop_loss"
+    assert check_crypto_stops(pos, 1.20) == "take_profit"
+    assert check_crypto_stops(pos, 1.25) == "take_profit"
+    assert check_crypto_stops(pos, 1.0) is None
+    assert check_crypto_stops(pos, 0.0) is None  # no usable price
+
+
+def test_check_crypto_stops_ignores_stocks():
+    pos = Position(
+        market=Market.STOCKS, symbol="ACME", quantity=10,
+        entry_price=50, current_price=40,
+        stop_price=46, take_profit_price=60,
+    )
+    assert check_crypto_stops(pos, 40) is None
+
+
+async def test_open_crypto_sets_stop_and_take_profit(tmp_path):
+    desk = build(tmp_path)
+    token = Token(
+        mint="M1", symbol="WIF2", holders=200, buys=90, sells=25,
+        unique_traders=60, liquidity_usd=40000, mint_revoked=True,
+        age_seconds=300, curve_sol=32.0, curve_tokens=800_000_000.0,
+    )
+    result = await desk.evaluate_token(token)
+    assert result["bought"] is True
+    assert len(desk.positions) == 1
+    pos = desk.positions[0]
+    quote = curve_price(token)
+    # Paper fill: at the quote plus curve impact and the protocol fee, never better.
+    assert quote < pos.entry_price <= quote * 1.05
+    entry = pos.entry_price
+    stop_pct = desk.exits_cfg["stop_loss_pct"]
+    runner_cap = desk.exits_cfg["ladder"]["runner_take_profit_pct"]
+    assert pos.stop_price == pytest.approx(entry * (1 - stop_pct))
+    # Ladder on: take_profit_price is the runner cap; rungs live in meta["ladder"].
+    assert pos.take_profit_price == pytest.approx(entry * (1 + runner_cap))
+    assert pos.meta["ladder"]["rungs_hit"] == []
+    assert result["stop_price"] == pos.stop_price
+    assert result["take_profit_price"] == pos.take_profit_price
+
+
+async def test_check_open_crypto_stops_closes_on_mocked_price(tmp_path):
+    desk = build(tmp_path)
+    entry = 1.0
+    pos = Position(
+        market=Market.CRYPTO, symbol="WIF2", quantity=1000,
+        entry_price=entry, current_price=entry, amount_usd=100.0,
+        stop_price=0.92, take_profit_price=1.20,
+        meta={"mint": "M1"},
+    )
+    desk.positions = [pos]
+    desk.risk.record_fill(Market.CRYPTO, 100.0)
+
+    closed = await desk.check_open_crypto_stops(prices={"M1": 0.90})
+    assert len(closed) == 1
+    assert closed[0]["reason"] == "stop_loss"
+    assert closed[0]["closed"] is True
+    assert desk.positions == []
+
+    records = [json.loads(line) for line in open(tmp_path / "desk.jsonl")]
+    types = [r["type"] for r in records]
+    assert "action" in types and "close" in types
+    action = next(r for r in records if r["type"] == "action")
+    assert action["action"] == "CLOSE" and action["reason"] == "stop_loss"
+
+
+async def test_check_open_crypto_stops_closes_at_take_profit(tmp_path):
+    desk = build(tmp_path)
+    pos = Position(
+        market=Market.CRYPTO, symbol="WIF2", quantity=1000,
+        entry_price=1.0, current_price=1.0, amount_usd=100.0,
+        stop_price=0.92, take_profit_price=1.20,
+        meta={"mint": "M1"},
+    )
+    desk.positions = [pos]
+    desk.risk.record_fill(Market.CRYPTO, 100.0)
+
+    closed = await desk.check_open_crypto_stops(prices={"M1": 1.25})
+    assert closed[0]["reason"] == "take_profit"
+    assert desk.positions == []
+
+
+async def test_bundled_launch_veto_reaches_the_desk(tmp_path):
+    desk = build(tmp_path, {"auditor": {**GOOD["auditor"], "bundled_launch": True}})
+    result = await desk.evaluate_token(TOKEN)
+    assert result["reason"] == "veto_bundled_launch"
+    assert desk.crypto_checker._client.calls == []
