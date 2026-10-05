@@ -34,6 +34,10 @@ class RiskManager:
         self.max_position_pct_of_remaining_loss = float(
             risk.get("max_position_pct_of_remaining_loss", 0.25)
         )
+        # Crypto-only: cap notional to a fraction of bonding-curve liquidity USD.
+        self.max_position_pct_of_liquidity = float(
+            risk.get("max_position_pct_of_liquidity", 0.03)
+        )
 
         self.allocation = Allocation()
         self.realized_pnl_today = 0.0
@@ -121,12 +125,20 @@ class RiskManager:
 
         return True, "ok"
 
-    def position_size(self, market: Market, score: float = 1.0) -> float:
+    def position_size(
+        self,
+        market: Market,
+        score: float = 1.0,
+        liquidity_usd: float | None = None,
+    ) -> float:
         """USD for one new trade, floored at 0.
 
         Bounded three ways: a share of that market's budget, a share of what is
         left of today's loss allowance, and whatever budget is actually free.
         The score scales linearly between half size and full size.
+
+        Crypto only: when `liquidity_usd` is provided, also cap to
+        `max_position_pct_of_liquidity` of curve liquidity (default 3%).
         """
         by_market = self.market_budget(market) * self.max_position_pct_of_market
         by_loss_room = self.remaining_loss_room() * self.max_position_pct_of_remaining_loss
@@ -135,6 +147,15 @@ class RiskManager:
         size = min(by_market, by_loss_room, free)
         confidence = max(0.0, min(1.0, float(score)))
         size *= 0.5 + 0.5 * confidence
+
+        if (
+            market == Market.CRYPTO
+            and liquidity_usd is not None
+            and float(liquidity_usd) > 0
+            and self.max_position_pct_of_liquidity > 0
+        ):
+            size = min(size, float(liquidity_usd) * self.max_position_pct_of_liquidity)
+
         return round(max(0.0, size), 2)
 
     def snapshot(self, positions: list[Position] | None = None) -> dict[str, Any]:

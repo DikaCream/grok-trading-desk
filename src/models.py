@@ -40,14 +40,17 @@ class Token(BaseModel):
     liquidity_usd: float = 0.0
     market_cap_usd: float = 0.0
     holders: int = 0
+    # True only when an on-chain enricher filled `holders`. Watch-window unique
+    # traders must not be treated as a holder count (see scout + enricher).
+    holders_known: bool = False
     top10_holder_pct: float = 0.0
     dev_holding_pct: float = 0.0
     age_seconds: float = 0.0
     buys: int = 0
     sells: int = 0
-    # Tri-state on purpose. The create event carries neither, and `False` would
-    # be indistinguishable from "not checked" - which is what made the old
-    # require_mint_revoked filter reject every real token.
+    # Tri-state on purpose. None = unknown (enricher did not confirm). After
+    # enrichment, stage-two hard requires reject None as mint_unknown / lp_unknown
+    # rather than silently passing.
     mint_revoked: bool | None = None
     lp_burned: bool | None = None
     socials: dict[str, str] = Field(default_factory=dict)
@@ -133,6 +136,8 @@ class Position(BaseModel):
     amount_usd: float = 0.0
     stop_price: float | None = None
     take_profit_price: float | None = None
+    # Peak mark since entry — used by crypto trailing stops. Stocks ignore it.
+    peak_price: float | None = None
     sector: str = "unknown"
     opened_at: datetime = Field(default_factory=_utcnow)
     score: float = 0.0
@@ -144,6 +149,10 @@ class Position(BaseModel):
         if opened.tzinfo is None:
             opened = opened.replace(tzinfo=timezone.utc)
         return (_utcnow() - opened).total_seconds() / 3600.0
+
+    @property
+    def hold_time_minutes(self) -> float:
+        return self.hold_time_hours * 60.0
 
     @property
     def pnl_usd(self) -> float:
