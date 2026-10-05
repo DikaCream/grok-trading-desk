@@ -18,13 +18,38 @@ DEFAULT_WEIGHTS = {
     "min_score_to_buy": 0.62,
 }
 
+# Hard veto defaults — old configs without crypto_vetoes still get these gates.
+DEFAULT_VETOES = {
+    "veto_bundled_launch": True,
+    "max_sniper_pct": 0.25,
+    "max_insider_pct": 0.15,
+}
 
-def hard_veto(audit: dict[str, Any], pulse: dict[str, Any], min_go_signal: float = 0.3) -> str | None:
+
+def hard_veto(
+    audit: dict[str, Any],
+    pulse: dict[str, Any],
+    min_go_signal: float = 0.3,
+    vetoes: dict[str, Any] | None = None,
+) -> str | None:
     """Return the veto reason, or None. Checked before scoring."""
+    v = {**DEFAULT_VETOES, **(vetoes or {})}
+
     if audit.get("coordinated_buys"):
         return "veto_coordinated_buys"
     if audit.get("wash_trading"):
         return "veto_wash_trading"
+    if v.get("veto_bundled_launch", True) and audit.get("bundled_launch"):
+        return "veto_bundled_launch"
+
+    max_sniper = v.get("max_sniper_pct")
+    if max_sniper is not None and float(audit.get("sniper_pct", 0.0) or 0.0) > float(max_sniper):
+        return "veto_sniper_pct"
+
+    max_insider = v.get("max_insider_pct")
+    if max_insider is not None and float(audit.get("insider_pct", 0.0) or 0.0) > float(max_insider):
+        return "veto_insider_pct"
+
     if float(pulse.get("go_signal", 0.0)) < min_go_signal:
         return "veto_market_paused"
     return None
@@ -67,11 +92,12 @@ def score_token(
     pulse: dict[str, Any],
     weights: dict[str, Any] | None = None,
     min_go_signal: float = 0.3,
+    vetoes: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Weighted score plus the buy/skip verdict and its components."""
     w = {**DEFAULT_WEIGHTS, **(weights or {})}
 
-    veto = hard_veto(audit, pulse, min_go_signal)
+    veto = hard_veto(audit, pulse, min_go_signal, vetoes=vetoes)
     components = {
         "audit_safety": audit_score(audit),
         "narrative": narrative_score(narrative),
